@@ -1,0 +1,498 @@
+/*
+  # Enhanced User Creation System with Setup Links
+
+  1. New Functions
+    - `create_user_with_setup_link` - Creates a user with a setup link instead of a temporary password
+    - `verify_setup_link` - Verifies a setup link and returns user information
+    - `complete_setup` - Completes the setup process by setting the user's password
+
+  2. Security Features
+    - Secure link generation
+    - Link expiration
+    - Password complexity validation
+    - Comprehensive logging
+*/
+
+-- Function to create a user with a setup link
+CREATE OR REPLACE FUNCTION create_user_with_setup_link(
+  user_email text,
+  user_role text DEFAULT 'user',
+  user_name text DEFAULT NULL,
+  link_expiry_days integer DEFAULT 7
+)
+RETURNS jsonb
+SECURITY DEFINER
+SET search_path = public
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  new_user_id uuid;
+  setup_token text;
+  token_expiry timestamptz;
+  current_time timestamptz := now();
+  log_id uuid;
+  setup_url text;
+BEGIN
+  -- Validate inputs
+  IF user_email IS NULL OR user_email = '' THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'Email is required'
+    );
+  END IF;
+  
+  IF NOT (user_email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$') THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'Invalid email format'
+    );
+  END IF;
+  
+  -- Check if user already exists
+  IF EXISTS (SELECT 1 FROM auth.users WHERE email = user_email) THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'User with this email already exists'
+    );
+  END IF;
+  
+  -- Verify the current user is an admin
+  IF NOT is_admin() THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'Only administrators can create users'
+    );
+  END IF;
+  
+  -- Generate a secure setup token
+  setup_token := generate_secure_token(32);
+  token_expiry := current_time + (link_expiry_days || ' days')::interval;
+  
+  -- Generate new user ID
+  new_user_id := generate_uuid();
+  
+  -- Create the setup URL
+  setup_url := 'https://splendid-semolina-29baa8.netlify.app/setup-password?token=' || setup_token;
+  
+  -- Create log entry for audit trail
+  INSERT INTO auth_logs (
+    action,
+    actor_id,
+    target_email,
+    ip_address,
+    user_agent,
+    metadata
+  ) VALUES (
+    'create_user_with_setup_link',
+    auth.uid(),
+    user_email,
+    current_setting('request.headers', true)::json->>'x-forwarded-for',
+    current_setting('request.headers', true)::json->>'user-agent',
+    jsonb_build_object(
+      'role', user_role,
+      'token_expiry', token_expiry,
+      'created_at', current_time
+    )
+  ) RETURNING id INTO log_id;
+  
+  -- Create the user with a temporary password and setup token
+  INSERT INTO auth.users (
+    instance_id,
+    id,
+    aud,
+    role,
+    email,
+    encrypted_password,
+    email_confirmed_at,
+    raw_user_meta_data,
+    created_at,
+    updated_at
+  ) VALUES (
+    '00000000-0000-0000-0000-000000000000',
+    new_user_id,
+    'authenticated',
+    'authenticated',
+    user_email,
+    -- Use a random password that the user will never know
+    crypt(generate_secure_token(32), gen_salt('bf', 10)),
+    current_time, -- Auto-confirm email for admin-created accounts
+    jsonb_build_object(
+      'role', user_role,
+      'full_name', COALESCE(user_name, ''),
+      'created_by', auth.uid(),
+      'created_at', current_time,
+      'password_setup_required', true,
+      'password_setup_token', setup_token,
+      'password_setup_token_expiry', token_expiry,
+      'setup_log_id', log_id
+    ),
+    current_time,
+    current_time
+  );
+  
+  -- Create default app settings for the user
+  INSERT INTO app_settings (
+    user_id,
+    theme,
+    accent_color,
+    notifications_settings,
+    client_type_settings,
+    google_integration_settings
+  ) VALUES (
+    new_user_id,
+    'light',
+    '#3B82F6',
+    '{"overdueInvoices": true, "newPayments": true, "dueDateReminders": true, "weeklyReport": false}',
+    '{"externe": {"defaultPaymentDays": 30, "defaultPaymentMode": "Virement"}, "interne": {"defaultPaymentDays": 15, "defaultPaymentMode": "Virement"}, "partenaire": {"defaultPaymentDays": 60, "defaultPaymentMode": "Virement"}}',
+    '{"isConnected": false}'
+  );
+  
+  -- Return success with setup link
+  RETURN jsonb_build_object(
+    'success', true,
+    'user_id', new_user_id,
+    'email', user_email,
+    'setup_url', setup_url,
+    'setup_token', setup_token,
+    'token_expiry', token_expiry,
+    'message', 'User created successfully. Share the setup link with the user.'
+  );
+EXCEPTION
+  WHEN OTHERS THEN
+    -- Log the error
+    INSERT INTO auth_logs (
+      action,
+      actor_id,
+      target_email,
+      ip_address,
+      user_agent,
+      metadata,
+      error_message
+    ) VALUES (
+      'create_user_error',
+      auth.uid(),
+      user_email,
+      current_setting('request.headers', true)::json->>'x-forwarded-for',
+      current_setting('request.headers', true)::json->>'user-agent',
+      jsonb_build_object(
+        'role', user_role,
+        'error_time', current_time
+      ),
+      SQLERRM
+    );
+    
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'Error creating user: ' || SQLERRM
+    );
+END;
+$$;
+
+-- Function to verify a setup link
+CREATE OR REPLACE FUNCTION verify_setup_link(setup_token text)
+RETURNS jsonb
+SECURITY DEFINER
+SET search_path = public
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  user_record auth.users%ROWTYPE;
+  token_expiry timestamptz;
+  current_time timestamptz := now();
+BEGIN
+  -- Find the user with this token
+  SELECT * INTO user_record
+  FROM auth.users 
+  WHERE raw_user_meta_data->>'password_setup_token' = setup_token;
+
+  IF user_record.id IS NULL THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'Invalid setup link'
+    );
+  END IF;
+
+  -- Verify token expiration
+  token_expiry := (user_record.raw_user_meta_data->>'password_setup_token_expiry')::timestamptz;
+  
+  IF token_expiry IS NULL OR token_expiry < current_time THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'Setup link has expired'
+    );
+  END IF;
+
+  -- Verify setup is still required
+  IF COALESCE(user_record.raw_user_meta_data->>'password_setup_required', 'false') != 'true' THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'Password has already been set'
+    );
+  END IF;
+
+  -- Log the verification
+  INSERT INTO auth_logs (
+    action,
+    target_id,
+    target_email,
+    ip_address,
+    user_agent,
+    metadata
+  ) VALUES (
+    'verify_setup_link',
+    user_record.id,
+    user_record.email,
+    current_setting('request.headers', true)::json->>'x-forwarded-for',
+    current_setting('request.headers', true)::json->>'user-agent',
+    jsonb_build_object(
+      'verified_at', current_time
+    )
+  );
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'email', user_record.email,
+    'user_id', user_record.id,
+    'name', user_record.raw_user_meta_data->>'full_name',
+    'token_expiry', token_expiry
+  );
+EXCEPTION
+  WHEN OTHERS THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'Error verifying setup link: ' || SQLERRM
+    );
+END;
+$$;
+
+-- Function to complete the setup process
+CREATE OR REPLACE FUNCTION complete_setup(
+  setup_token text,
+  new_password text
+)
+RETURNS jsonb
+SECURITY DEFINER
+SET search_path = public
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  user_record auth.users%ROWTYPE;
+  token_expiry timestamptz;
+  current_time timestamptz := now();
+  log_id uuid;
+  setup_log_id uuid;
+BEGIN
+  -- Find the user with this token
+  SELECT * INTO user_record
+  FROM auth.users 
+  WHERE raw_user_meta_data->>'password_setup_token' = setup_token;
+
+  IF user_record.id IS NULL THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'Invalid setup link'
+    );
+  END IF;
+
+  -- Verify token expiration
+  token_expiry := (user_record.raw_user_meta_data->>'password_setup_token_expiry')::timestamptz;
+  
+  IF token_expiry IS NULL OR token_expiry < current_time THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'Setup link has expired'
+    );
+  END IF;
+
+  -- Verify setup is still required
+  IF COALESCE(user_record.raw_user_meta_data->>'password_setup_required', 'false') != 'true' THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'Password has already been set'
+    );
+  END IF;
+
+  -- Validate password strength
+  IF length(new_password) < 8 THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'Password must be at least 8 characters long'
+    );
+  END IF;
+
+  -- Get the original setup log ID for reference
+  setup_log_id := (user_record.raw_user_meta_data->>'setup_log_id')::uuid;
+
+  -- Log the completion
+  INSERT INTO auth_logs (
+    action,
+    target_id,
+    target_email,
+    ip_address,
+    user_agent,
+    metadata
+  ) VALUES (
+    'complete_setup',
+    user_record.id,
+    user_record.email,
+    current_setting('request.headers', true)::json->>'x-forwarded-for',
+    current_setting('request.headers', true)::json->>'user-agent',
+    jsonb_build_object(
+      'related_log_id', setup_log_id,
+      'completed_at', current_time
+    )
+  ) RETURNING id INTO log_id;
+
+  -- Update the user's password and metadata
+  UPDATE auth.users
+  SET
+    encrypted_password = crypt(new_password, gen_salt('bf', 10)),
+    email_confirmed_at = COALESCE(email_confirmed_at, current_time),
+    raw_user_meta_data = raw_user_meta_data - 'password_setup_required' - 'password_setup_token' - 'password_setup_token_expiry' - 'setup_log_id',
+    raw_user_meta_data = jsonb_set(
+      raw_user_meta_data,
+      '{password_set_at}',
+      to_jsonb(current_time)
+    ),
+    updated_at = current_time
+  WHERE id = user_record.id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'message', 'Password set successfully. You can now log in with your email and password.'
+  );
+EXCEPTION
+  WHEN OTHERS THEN
+    -- Log the error
+    INSERT INTO auth_logs (
+      action,
+      target_id,
+      target_email,
+      ip_address,
+      user_agent,
+      metadata,
+      error_message
+    ) VALUES (
+      'complete_setup_error',
+      user_record.id,
+      user_record.email,
+      current_setting('request.headers', true)::json->>'x-forwarded-for',
+      current_setting('request.headers', true)::json->>'user-agent',
+      jsonb_build_object(
+        'error_time', current_time
+      ),
+      SQLERRM
+    );
+    
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'Error setting password: ' || SQLERRM
+    );
+END;
+$$;
+
+-- Function to check if email exists and send magic link
+CREATE OR REPLACE FUNCTION check_email_and_send_link(user_email text)
+RETURNS jsonb
+SECURITY DEFINER
+SET search_path = public
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  user_exists boolean;
+  needs_setup boolean;
+  setup_token text;
+  token_expiry timestamptz;
+  current_time timestamptz := now();
+  setup_url text;
+BEGIN
+  -- Check if user exists
+  SELECT EXISTS (
+    SELECT 1 FROM auth.users WHERE email = user_email
+  ) INTO user_exists;
+
+  IF NOT user_exists THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'No account found with this email address'
+    );
+  END IF;
+
+  -- Check if user needs password setup
+  SELECT 
+    COALESCE(raw_user_meta_data->>'password_setup_required', 'false') = 'true'
+  INTO needs_setup
+  FROM auth.users
+  WHERE email = user_email;
+
+  -- If user needs setup, generate a new setup link
+  IF needs_setup THEN
+    -- Generate a new token
+    setup_token := generate_secure_token(32);
+    token_expiry := current_time + interval '24 hours';
+    setup_url := 'https://splendid-semolina-29baa8.netlify.app/setup-password?token=' || setup_token;
+
+    -- Update the user's metadata
+    UPDATE auth.users
+    SET
+      raw_user_meta_data = jsonb_set(
+        COALESCE(raw_user_meta_data, '{}'),
+        '{password_setup_token}',
+        to_jsonb(setup_token)
+      ),
+      raw_user_meta_data = jsonb_set(
+        raw_user_meta_data,
+        '{password_setup_token_expiry}',
+        to_jsonb(token_expiry)
+      ),
+      updated_at = current_time
+    WHERE email = user_email;
+
+    -- Log the action
+    INSERT INTO auth_logs (
+      action,
+      target_email,
+      ip_address,
+      user_agent,
+      metadata
+    ) VALUES (
+      'send_setup_link',
+      user_email,
+      current_setting('request.headers', true)::json->>'x-forwarded-for',
+      current_setting('request.headers', true)::json->>'user-agent',
+      jsonb_build_object(
+        'setup_url', setup_url,
+        'token_expiry', token_expiry,
+        'sent_at', current_time
+      )
+    );
+
+    RETURN jsonb_build_object(
+      'success', true,
+      'needs_setup', true,
+      'setup_url', setup_url,
+      'message', 'Setup link sent to your email'
+    );
+  ELSE
+    -- User exists and has already set up their password
+    -- We could send a magic link or password reset link here
+    RETURN jsonb_build_object(
+      'success', true,
+      'needs_setup', false,
+      'message', 'Please enter your password to log in'
+    );
+  END IF;
+EXCEPTION
+  WHEN OTHERS THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'Error processing request: ' || SQLERRM
+    );
+END;
+$$;
+
+-- Grant execute permissions
+GRANT EXECUTE ON FUNCTION create_user_with_setup_link(text, text, text, integer) TO authenticated;
+GRANT EXECUTE ON FUNCTION verify_setup_link(text) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION complete_setup(text, text) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION check_email_and_send_link(text) TO anon, authenticated;
